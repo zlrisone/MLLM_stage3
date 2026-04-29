@@ -319,8 +319,7 @@ def sample_textqa(
             continue
         answers = row.get("answers")
         answer = _majority_answer(answers)
-        if not answer:
-            continue
+            
         image_rel = f"textqa/{sample_idx:07d}.jpg"
         image_abs = os.path.join(image_dir, image_rel)
         if not os.path.exists(image_abs):
