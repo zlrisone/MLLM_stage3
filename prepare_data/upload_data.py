@@ -2,8 +2,9 @@
 将本地 prepare_* 脚本生成的 train / val / test 三套数据一并上传到 HuggingFace Hub。
 
 约定（与 prepare_train_data / prepare_val_data / prepare_test_data 一致）：
-    每个根目录下包含 ``chat.json`` 与 ``images/``。本地 ``chat.json`` 可含 ``id`` 等字段；
-    **上传到 Hub 的每条样本**与 ``lmms-lab/TextCaps`` 风格对齐，仅三列：
+    每个根目录下包含 ``chat.json`` 与 ``images/``。
+    **上传到 Hub 的每条样本**在 TextCaps 三列基础上增加 ``id``，共四列：
+    - ``id``：字符串，优先取 ``chat.json`` 中样本的 ``id``；缺失则生成为 ``idx_<序号>``
     - ``image``：``datasets.Image``，``load_dataset`` 后用下标访问为 ``PIL.Image.Image``
     - ``conversations``：对话列表 ``[{"role","content"}, ...]``（多模态指令与回复）
     - ``source``：字符串，样本来源标签（如 ``caption`` / ``vqa``）
@@ -18,7 +19,7 @@
 
 用法（在 ``stage3`` 项目根目录执行示例）：
     python upload_data.py \
-        --repo-id Lris47/MLLM3-textcaps-scienceqa-vqav2 \
+        --repo-id Lris47/MLLMstage3-textcaps-scienceqa-textvqa \
         --train-dir ./stage3_train_data \
         --val-dir ./stage3_val_data \
         --test-dir ./stage3_test_data
@@ -77,23 +78,26 @@ def _normalize_conversation_messages(raw: Any, sample_id: Any) -> List[Dict[str,
 
 
 def records_to_hub_rows(records: List[Dict[str, Any]], image_root: str) -> List[Dict[str, Any]]:
-    """构造与 ``lmms-lab/TextCaps`` 列风格一致的三字段行：image / conversations / source。
+    """构造上传行：id / image / conversations / source。
 
     ``image`` 此处为本地绝对路径字符串，交给 ``datasets.Image`` 编码；推送 Parquet 并
     ``embed_external_files=True`` 时，Hub 端为内嵌图像；``load_dataset`` 后列为
     ``PIL.Image.Image``。
     """
     rows: List[Dict[str, Any]] = []
-    for r in records:
+    for i, r in enumerate(records):
+        raw_id = r.get("id")
+        sample_id = str(raw_id).strip() if raw_id is not None and str(raw_id).strip() else f"idx_{i:09d}"
         rel = r.get("image")
         if not rel:
-            raise ValueError(f"样本缺少 image 字段: id={r.get('id')}")
+            raise ValueError(f"样本缺少 image 字段: id={sample_id}")
         abs_path = os.path.join(image_root, rel)
         if not os.path.isfile(abs_path):
-            raise FileNotFoundError(f"图像不存在: {abs_path} (id={r.get('id')})")
+            raise FileNotFoundError(f"图像不存在: {abs_path} (id={sample_id})")
         rows.append({
+            "id": sample_id,
             "image": abs_path,
-            "conversations": _normalize_conversation_messages(r.get("conversations"), r.get("id")),
+            "conversations": _normalize_conversation_messages(r.get("conversations"), sample_id),
             "source": r.get("source", "") or "",
         })
     return rows
@@ -118,6 +122,7 @@ def push_datasetdict_to_hub(
     # 须用 List(struct)，勿用 Sequence({...})：后者在 HF datasets 中会展开成
     # ``{role: List(...), content: List(...)}``（按列对齐），与 list[dict] 样本不兼容。
     features = Features({
+        "id": Value("string"),
         "image": HFImage(),
         "conversations": List({
             "role": Value("string"),
