@@ -2,18 +2,25 @@
 将本地 prepare_* 脚本生成的 train / val / test 三套数据一并上传到 HuggingFace Hub。
 
 约定（与 prepare_train_data / prepare_val_data / prepare_test_data 一致）：
-    每个根目录下包含 ``chat.json`` 与 ``images/``，``chat.json`` 里每条样本的 ``image``
-    为相对 ``images/`` 的路径；``conversations`` 为 ``[{"role","content"}, ...]``。
+    每个根目录下包含 ``chat.json`` 与 ``images/``。本地 ``chat.json`` 可含 ``id`` 等字段；
+    **上传到 Hub 的每条样本**与 ``lmms-lab/TextCaps`` 风格对齐，仅三列：
+    - ``image``：``datasets.Image``，``load_dataset`` 后用下标访问为 ``PIL.Image.Image``
+    - ``conversations``：对话列表 ``[{"role","content"}, ...]``（多模态指令与回复）
+    - ``source``：字符串，样本来源标签（如 ``caption`` / ``vqa``）
 
 上传为一个 ``DatasetDict``，split 名称：
     ``train`` | ``validation`` | ``test``
 （本地验证集目录对应 Hub 上的 ``validation`` split）
 
+存储格式：
+    ``DatasetDict.push_to_hub`` 以 **Parquet 分片** 写入 Hub。默认 ``embed_external_files=True``
+    将图像字节写入 Parquet，下载后可直接得到解码后的 ``PIL.Image``。
+
 用法（在 ``stage3`` 项目根目录执行示例）：
-    python prepare_data/upload_data.py \\
-        --repo-id YOUR_USERNAME/stage3_mm \\
-        --train-dir ./stage3_train_data \\
-        --val-dir ./stage3_val_data \\
+    python upload_data.py \
+        --repo-id Lris47/MLLM3-textcaps-scienceqa-vqav2 \
+        --train-dir ./stage3_train_data \
+        --val-dir ./stage3_val_data \
         --test-dir ./stage3_test_data
 
 需已登录 HuggingFace CLI（``huggingface-cli login``）或设置环境变量 ``HF_TOKEN``。
@@ -42,8 +49,40 @@ def load_chat_records(root: str) -> List[Dict[str, Any]]:
     return data
 
 
+def _normalize_conversation_messages(raw: Any, sample_id: Any) -> List[Dict[str, str]]:
+    """Hub 列 ``List({role, content})`` 要求每条消息为 ``dict``；部分 JSON 可能为 ``[role, content]``。"""
+    if raw is None:
+        raise ValueError(f"样本缺少 conversations: id={sample_id}")
+    if not isinstance(raw, list):
+        raise TypeError(f"conversations 应为 list，got {type(raw)!r} id={sample_id}")
+    out: List[Dict[str, str]] = []
+    for i, msg in enumerate(raw):
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+            if role is None and "from" in msg:
+                role = msg.get("from")
+        elif isinstance(msg, (list, tuple)) and len(msg) >= 2:
+            role, content = msg[0], msg[1]
+        else:
+            raise TypeError(
+                f"conversations[{i}] 须为 dict 或 [role, content] 二元组，"
+                f"got {type(msg)!r} id={sample_id}"
+            )
+        out.append({
+            "role": "" if role is None else str(role),
+            "content": "" if content is None else str(content),
+        })
+    return out
+
+
 def records_to_hub_rows(records: List[Dict[str, Any]], image_root: str) -> List[Dict[str, Any]]:
-    """image_root 一般为 ``{root}/images``。"""
+    """构造与 ``lmms-lab/TextCaps`` 列风格一致的三字段行：image / conversations / source。
+
+    ``image`` 此处为本地绝对路径字符串，交给 ``datasets.Image`` 编码；推送 Parquet 并
+    ``embed_external_files=True`` 时，Hub 端为内嵌图像；``load_dataset`` 后列为
+    ``PIL.Image.Image``。
+    """
     rows: List[Dict[str, Any]] = []
     for r in records:
         rel = r.get("image")
@@ -53,10 +92,9 @@ def records_to_hub_rows(records: List[Dict[str, Any]], image_root: str) -> List[
         if not os.path.isfile(abs_path):
             raise FileNotFoundError(f"图像不存在: {abs_path} (id={r.get('id')})")
         rows.append({
-            "id": r["id"],
-            "source": r.get("source", ""),
             "image": abs_path,
-            "conversations": r["conversations"],
+            "conversations": _normalize_conversation_messages(r.get("conversations"), r.get("id")),
+            "source": r.get("source", "") or "",
         })
     return rows
 
@@ -70,17 +108,22 @@ def push_datasetdict_to_hub(
     private: bool,
     token: str | None,
     max_shard_size: str | None,
+    embed_external_files: bool,
+    num_proc: int | None,
+    commit_message: str | None,
 ) -> None:
-    from datasets import Dataset, DatasetDict, Features, Image as HFImage, Sequence, Value
+    """调用 ``DatasetDict.push_to_hub``：Hub 侧为 Parquet；列顺序 image / conversations / source。"""
+    from datasets import Dataset, DatasetDict, Features, Image as HFImage, List, Value
 
+    # 须用 List(struct)，勿用 Sequence({...})：后者在 HF datasets 中会展开成
+    # ``{role: List(...), content: List(...)}``（按列对齐），与 list[dict] 样本不兼容。
     features = Features({
-        "id": Value("string"),
-        "source": Value("string"),
         "image": HFImage(),
-        "conversations": Sequence({
+        "conversations": List({
             "role": Value("string"),
             "content": Value("string"),
         }),
+        "source": Value("string"),
     })
 
     def _ds(rows: List[Dict[str, Any]], split_name: str):
@@ -94,13 +137,25 @@ def push_datasetdict_to_hub(
         "test": _ds(test_rows, "test"),
     })
 
-    kwargs: Dict[str, Any] = {"private": private}
+    kwargs: Dict[str, Any] = {
+        "private": private,
+        # HF Datasets：push_to_hub 即上传 Parquet；以下为 Parquet 写出/嵌入行为
+        "embed_external_files": embed_external_files,
+    }
     if token:
         kwargs["token"] = token
+    # 不传时使用库默认（通常为 500MB）；传入则控制单个 Parquet 分片体积
     if max_shard_size:
         kwargs["max_shard_size"] = max_shard_size
+    if num_proc is not None and num_proc > 0:
+        kwargs["num_proc"] = num_proc
+    if commit_message:
+        kwargs["commit_message"] = commit_message
 
-    print(f"[upload] push_to_hub repo_id={repo_id!r} private={private} ...")
+    print(
+        f"[upload] push_to_hub (Parquet shards) repo_id={repo_id!r} "
+        f"private={private} embed_external_files={embed_external_files} ..."
+    )
     dsd.push_to_hub(repo_id, **kwargs)
     print(f"[upload] done -> https://huggingface.co/datasets/{repo_id}")
 
@@ -128,7 +183,24 @@ def main() -> None:
         "--max-shard-size",
         type=str,
         default=None,
-        help="可选，如 ``500MB``，大库可限分片体积",
+        help="单个 Parquet 分片最大体积（如 ``500MB``）；不传则由 datasets 默认（通常为 500MB）",
+    )
+    parser.add_argument(
+        "--no-embed-external-files",
+        action="store_true",
+        help="不把图像字节写入 Parquet（仅保留路径类信息；Hub 离线克隆后可能无法直接看图）",
+    )
+    parser.add_argument(
+        "--num-proc",
+        type=int,
+        default=None,
+        help="写入/嵌入 Parquet 时的并行进程数（大数据集可选）",
+    )
+    parser.add_argument(
+        "--commit-message",
+        type=str,
+        default=None,
+        help="Hub 提交说明（可选）",
     )
     parser.add_argument(
         "--dry-run",
@@ -169,6 +241,9 @@ def main() -> None:
         private=private,
         token=args.token,
         max_shard_size=args.max_shard_size,
+        embed_external_files=not args.no_embed_external_files,
+        num_proc=args.num_proc,
+        commit_message=args.commit_message,
     )
 
 
