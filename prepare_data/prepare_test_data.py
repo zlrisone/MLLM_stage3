@@ -2,7 +2,7 @@
 Stage3 测试集预处理（与 prepare_train_data 相同 schema）：
     - lmms-lab/TextCaps → split ``test``
     - derek-thomas/ScienceQA → split ``test``
-    - lmms-lab/VQAv2 → split ``test``
+    - lmms-lab/textvqa → split ``test``（assistant 为 answers 众数）
 
 用法：
     python data2/prepare_test_data.py [--out_dir ./stage3_test_data] [--seed 42]
@@ -17,16 +17,16 @@ import os
 import random
 from typing import Any, Dict, List
 
-from prepare_train_data import IMAGE_PLACEHOLDER, sample_scienceqa, sample_textcaps, sample_vqav2
+from prepare_train_data import IMAGE_PLACEHOLDER, sample_scienceqa, sample_textcaps, sample_textqa
 
 SCIENCEQA_SPLIT = "test"
 TEXTCAPS_SPLIT = "test"
-VQAV2_SPLIT = "test"
+TEXTVQA_SPLIT = "test"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Stage3 测试集：TextCaps(test) + ScienceQA(test) + VQAv2(test)，写出 chat.json / meta.json",
+        description="Stage3 测试集：TextCaps(test) + ScienceQA(test) + TextVQA(test)，写出 chat.json / meta.json",
     )
     parser.add_argument("--out_dir", type=str, default="./stage3_test_data", help="输出根目录（含 images/）")
     parser.add_argument("--seed", type=int, default=42, help="各数据源打乱及合并后 shuffle 的随机种子")
@@ -60,7 +60,7 @@ def main() -> None:
         )
     )
     all_records.extend(sample_textcaps(None, image_dir, rng, split=TEXTCAPS_SPLIT))
-    all_records.extend(sample_vqav2(None, image_dir, rng, split=VQAV2_SPLIT))
+    all_records.extend(sample_textqa(None, image_dir, rng, split=TEXTVQA_SPLIT))
 
     if not args.no_shuffle:
         rng.shuffle(all_records)
@@ -86,7 +86,7 @@ def main() -> None:
         "datasets": {
             "scienceqa": {"hf_id": "derek-thomas/ScienceQA", "split": SCIENCEQA_SPLIT},
             "textcaps": {"hf_id": "lmms-lab/TextCaps", "split": TEXTCAPS_SPLIT},
-            "vqav2": {"hf_id": "lmms-lab/VQAv2", "split": VQAV2_SPLIT},
+            "textvqa": {"hf_id": "lmms-lab/textvqa", "split": TEXTVQA_SPLIT},
         },
     }
     meta_path = os.path.join(out_dir, "meta.json")

@@ -1,6 +1,6 @@
 """
 Stage3 数据预处理：
-    1) 下载 ScienceQA、TextCaps、VQAv2 数据集
+    1) 下载 ScienceQA、TextCaps、TextVQA（lmms-lab/textvqa）数据集
     2) 统一转成 {role, content} 形式的 conversations，image 占位符直接嵌入 content
     3) 图像落盘为本地 jpg
     4) 写出 chat.json 与 meta.json
@@ -33,6 +33,7 @@ from typing import List, Dict, Any, Optional
 from PIL import Image
 from tqdm import tqdm
 from datasets import load_dataset
+from collections import Counter
 
 IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 
@@ -202,7 +203,7 @@ def sample_scienceqa(
         results.append({
             "id": f"scienceqa_{sample_idx:07d}",
             "image": image_rel,
-            "source": "vqa",
+            "source": "scienceQA",
             "conversations": [
                 {"role": "user", "content": with_image(user_text)},
                 {"role": "assistant", "content": assistant_text},
@@ -272,20 +273,41 @@ def sample_textcaps(
     return results
 
 
-def sample_vqav2(
+def _majority_answer(answers) -> Optional[str]:
+    """从多条标注中取众数答案；支持 list[str] 或 list[dict]（含 answer 等键）。"""
+    if not answers:
+        return None
+    texts: List[str] = []
+    for item in answers:
+        if isinstance(item, dict):
+            s = item.get("answer")
+            if s is None:
+                s = item.get("text") or item.get("raw")
+        else:
+            s = item
+        if s is None:
+            continue
+        t = str(s).strip()
+        if t:
+            texts.append(t)
+    if not texts:
+        return None
+    return Counter(texts).most_common(1)[0][0]
+
+def sample_textqa(
     num_samples: Optional[int],
     image_dir: str,
     rng: random.Random,
-    split: str = "validation",
+    split: str = "train",
 ) -> List[Dict[str, Any]]:
-    print(f"[vqav2] loading dataset split={split!r} ...")
-    ds = load_dataset("lmms-lab/VQAv2", split=split)
-    print(f"[vqav2] total rows: {len(ds)}")
+    print(f"[textvqa] loading dataset split={split!r} ...")
+    ds = load_dataset("lmms-lab/textvqa", split=split)
+    print(f"[textvqa] total rows: {len(ds)}")
     indices = list(range(len(ds)))
     rng.shuffle(indices)
     results: List[Dict[str, Any]] = []
     sample_idx = 0
-    for idx in tqdm(indices, desc=f"vqav2[{split}]"):
+    for idx in tqdm(indices, desc=f"textvqa[{split}]"):
         if num_samples is not None and len(results) >= num_samples:
             break
         row = ds[idx]
@@ -295,37 +317,38 @@ def sample_vqav2(
         img = _decode_image(row.get("image"))
         if img is None:
             continue
-        answer = row.get("multiple_choice_answer")
+        answers = row.get("answers")
+        answer = _majority_answer(answers)
         if not answer:
             continue
-        image_rel = f"vqav2/{sample_idx:07d}.jpg"
+        image_rel = f"textqa/{sample_idx:07d}.jpg"
         image_abs = os.path.join(image_dir, image_rel)
         if not os.path.exists(image_abs):
             try:
                 save_pil_image(img, image_abs)
             except Exception as e:
-                print(f"[vqav2] save image failed idx={idx}: {e}")
+                print(f"[textqa] save image failed idx={idx}: {e}")
                 continue
         results.append({
-            "id": f"vqav2_{sample_idx:07d}",
+            "id": f"textqa_{sample_idx:07d}",
             "image": image_rel,
-            "source": "vqa",
+            "source": "textqa",
             "conversations": [
                 {"role": "user", "content": with_image(question)},
                 {"role": "assistant", "content": answer},
             ],
         })
         sample_idx += 1
-    print(f"[vqav2] sampled {len(results)} records")
+    print(f"[textqa] sampled {len(results)} records")
     return results
 
 
 # -----------------------------------------------------------------------------
-# main：ScienceQA + TextCaps + VQAv2 全量导出，不写配置文件、不做配比裁剪
+# main：ScienceQA + TextCaps + TextVQA 全量导出，不写配置文件、不做配比裁剪
 # -----------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Stage3 训练数据：ScienceQA + TextCaps + VQAv2，全量可用样本，写出 chat.json / meta.json",
+        description="Stage3 训练数据：ScienceQA + TextCaps + TextVQA，全量可用样本，写出 chat.json / meta.json",
     )
     parser.add_argument("--out_dir", type=str, default="./stage3_train_data", help="输出根目录（含 images/）")
     parser.add_argument("--seed", type=int, default=42, help="各数据集行顺序打乱及合并后 shuffle 的随机种子")
@@ -337,7 +360,7 @@ def main() -> None:
     parser.add_argument(
         "--no-shuffle",
         action="store_true",
-        help="不打乱合并后的样本顺序（默认为 scienceqa→textcaps→vqav2 合并后再 shuffle）",
+        help="不打乱合并后的样本顺序（默认为 scienceqa→textcaps→textvqa 合并后再 shuffle）",
     )
     args = parser.parse_args()
 
@@ -351,7 +374,7 @@ def main() -> None:
     all_records: List[Dict[str, Any]] = []
     all_records.extend(sample_scienceqa(None, image_dir, rng, use_caption=args.scienceqa_use_caption))
     all_records.extend(sample_textcaps(None, image_dir, rng))
-    all_records.extend(sample_vqav2(None, image_dir, rng))
+    all_records.extend(sample_textqa(None, image_dir, rng))
 
     if not args.no_shuffle:
         rng.shuffle(all_records)
@@ -376,7 +399,7 @@ def main() -> None:
         "datasets": {
             "scienceqa": {"hf_id": "derek-thomas/ScienceQA", "split": "train"},
             "textcaps": {"hf_id": "lmms-lab/TextCaps", "split": "train"},
-            "vqav2": {"hf_id": "lmms-lab/VQAv2", "split": "validation"},
+            "textvqa": {"hf_id": "lmms-lab/textvqa", "split": "train"},
         },
     }
     meta_path = os.path.join(out_dir, "meta.json")

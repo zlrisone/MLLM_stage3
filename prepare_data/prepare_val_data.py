@@ -2,7 +2,7 @@
 Stage3 验证集预处理（与 prepare_train_data 相同 schema）：
     - lmms-lab/TextCaps → split ``val``
     - derek-thomas/ScienceQA → split ``validation``
-    - lmms-lab/VQAv2 → split ``testdev``
+    - lmms-lab/textvqa → split ``validation``（assistant 为 answers 众数）
 
 用法：
     python data2/prepare_val_data.py [--out_dir ./stage3_val_data] [--seed 42]
@@ -17,17 +17,17 @@ import os
 import random
 from typing import Any, Dict, List
 
-from prepare_train_data import IMAGE_PLACEHOLDER, sample_scienceqa, sample_textcaps, sample_vqav2
+from prepare_train_data import IMAGE_PLACEHOLDER, sample_scienceqa, sample_textcaps, sample_textqa
 
 # HF 侧 split 名称（与数据集卡片一致）
 SCIENCEQA_SPLIT = "validation"
 TEXTCAPS_SPLIT = "val"
-VQAV2_SPLIT = "testdev"
+TEXTVQA_SPLIT = "validation"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Stage3 验证集：TextCaps(val) + ScienceQA(validation) + VQAv2(testdev)，写出 chat.json / meta.json",
+        description="Stage3 验证集：TextCaps(val) + ScienceQA(validation) + TextVQA(validation)，写出 chat.json / meta.json",
     )
     parser.add_argument("--out_dir", type=str, default="./stage3_val_data", help="输出根目录（含 images/）")
     parser.add_argument("--seed", type=int, default=42, help="各数据源打乱及合并后 shuffle 的随机种子")
@@ -61,7 +61,7 @@ def main() -> None:
         )
     )
     all_records.extend(sample_textcaps(None, image_dir, rng, split=TEXTCAPS_SPLIT))
-    all_records.extend(sample_vqav2(None, image_dir, rng, split=VQAV2_SPLIT))
+    all_records.extend(sample_textqa(None, image_dir, rng, split=TEXTVQA_SPLIT))
 
     if not args.no_shuffle:
         rng.shuffle(all_records)
@@ -87,7 +87,7 @@ def main() -> None:
         "datasets": {
             "scienceqa": {"hf_id": "derek-thomas/ScienceQA", "split": SCIENCEQA_SPLIT},
             "textcaps": {"hf_id": "lmms-lab/TextCaps", "split": TEXTCAPS_SPLIT},
-            "vqav2": {"hf_id": "lmms-lab/VQAv2", "split": VQAV2_SPLIT},
+            "textvqa": {"hf_id": "lmms-lab/textvqa", "split": TEXTVQA_SPLIT},
         },
     }
     meta_path = os.path.join(out_dir, "meta.json")
