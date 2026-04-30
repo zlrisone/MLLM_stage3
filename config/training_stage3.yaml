@@ -1,0 +1,138 @@
+# ============================================================
+# Stage3 训练配置（多模态指令微调）
+# ============================================================
+
+# ------------------ 基础模型（锚点，供下方引用） ------------------
+_models:
+  vision: &vision_model "google/siglip2-base-patch16-224"
+  llm:    &llm_model    "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+# ============================================================
+# 1. 数据集
+# ============================================================
+dataset:
+  # 预训练模型名（用于加载 processor / tokenizer）
+  vision_model_name: *vision_model
+  qwen_model_name:   *llm_model
+
+  # 本地数据产物目录（由 prepare_stage3_data.py 生成）
+  data_root:  "./stage3_data"
+  # 留空 / null / 删除本行：按 train_json、val_json、test_json 各自所在目录使用 <dir>/images
+  # （适合 stage3_train_data、stage3_val_data 等分目录）；若填写路径则三套 split 共用该 images。
+  image_root: "./stage3_data/images"
+  train_json: "./stage3_data/train.json"
+  val_json:   "./stage3_data/val.json"
+  test_json:  "./stage3_data/test.json"
+
+  # DataLoader
+  batch_size:  16
+  num_workers: 2
+  max_length:  1024          # 多轮对话 + 长描述需要更长上下文
+
+  # prepare 脚本：数据采样
+  total_samples: 150000
+  seed:          42
+  ratios:
+    caption:      0.5
+    long_caption: 0.25
+    vqa:          0.25
+
+  # prepare 脚本：数据切分
+  train_ratio: 0.8
+  val_ratio:   0.1
+  test_ratio:  0.1
+
+  # 可选：切分后上传到 HuggingFace Hub
+  hf_repo_id: "Lris47/MLLMstage3-textcaps-scienceqa-textvqa"
+
+
+# ============================================================
+# 2. 模型结构
+# ============================================================
+model:
+  # 视觉编码器
+  vision_encoder:
+    model_name: *vision_model
+    freeze:     True
+
+  # LLM 解码器
+  llm:
+    model_name:   *llm_model
+    freeze:       True
+    use_lora:     True
+    image_pad_id: 151655
+
+  # Projector 选型
+  projector:
+    type: "deepmlp"          # 可选: linear | mlp | deepmlp
+
+  # 各 Projector 的超参（按 projector.type 选用其中一组）
+  LinearProjector:
+    input_dim: 768
+
+  MLPProjector:
+    input_dim:  768
+    hidden_dim: 1536
+    activation: "gelu"
+    dropout:    0.05
+
+  DeepMLPProjector:
+    input_dim:  768
+    hidden_dim: 1536
+    dropout:    0.05
+
+  # LoRA（仅当 llm.use_lora=True 时生效）
+  lora:
+    r:           16
+    alpha:       32
+    dropout:     0.05
+    lora_layers: 16          # 仅在最后 N 层应用 LoRA
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+
+# ============================================================
+# 3. 训练
+# ============================================================
+epochs:                      1
+max_grad_norm:               1.0
+gradient_accumulation_steps: 1
+
+optimizer:
+  name:         "adamw"
+  lr:           0.001
+  weight_decay: 0.0
+  betas:        [0.9, 0.999]
+
+scheduler:
+  name:         "cosine"
+  warmup_steps: 100
+
+
+# ============================================================
+# 4. 日志 & 检查点 & 评估
+# ============================================================
+logging_steps: 10
+eval_steps:    500
+save_steps:    1000
+save_dir:      "./outputs"
+
+project_name: "multimodal-caption"
+run_name:     "stage3"
+use_wandb:    True
+
+
+# ============================================================
+# 5. 生成（推理 / 评估）
+# ============================================================
+generation:
+  max_new_tokens: 512
+  num_beams:      1
+  do_sample:      False

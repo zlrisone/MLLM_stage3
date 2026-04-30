@@ -1,0 +1,24 @@
+# Stage3 依赖
+# 建议 Python >= 3.10
+# 安装: pip install -r requirements.txt
+
+# 深度学习核心
+torch
+transformers
+peft
+
+# 数据 / 图像
+datasets
+Pillow
+numpy
+
+# 工具
+pyyaml
+tqdm
+
+# 评测指标 (BLEU / ROUGE / CIDEr / METEOR)
+pycocoevalcap
+nltk
+
+# 实验记录
+wandb
