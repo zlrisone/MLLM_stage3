@@ -73,14 +73,12 @@ class MultiModalInstructDataset(Dataset):
 
     def _build_prompt(
         self, conversations: List[Dict[str, str]]
-    ) -> Tuple[str, List[Tuple[int, int]], str, str]:
+    ) -> Tuple[str, str, str]:
         """
         使用 `apply_chat_template` 组装 prompt。
 
         返回：
             full_text        : 完整渲染后的字符串（train 模式 tokenize 这个）
-            assistant_spans  : full_text 中每个 assistant reply + 末尾 <|im_end|> 的
-                               字符区间 [start, end)，用于 label mask
             prompt_text      : eval/test 模式下给模型续写的 prompt（到最后一个
                                assistant 之前 + `<|im_start|>assistant\\n`）
             last_reference   : 最后一个 assistant 的原文（评测参考）
@@ -90,53 +88,14 @@ class MultiModalInstructDataset(Dataset):
         full_text = self.tokenizer.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=False,
         )
-
-        # 定位每个 assistant reply 在 full_text 中的 [start, end)。
-        # 策略：对每个 assistant 消息，在 full_text 中找其 content 的子串位置，
-        # 并把区间扩到紧随其后的 "<|im_end|>"（包含末尾的 stop token，便于训练学到停止）。
-        assistant_spans: List[Tuple[int, int]] = []
-        search_from = 0
-        for m in msgs:
-            if m.get("role") != "assistant":
-                continue
-            content = (m.get("content") or "").strip()
-            if not content:
-                continue
-            pos = full_text.find(content, search_from)
-            if pos < 0:
-                # content 在 chat template 里可能被 strip/escape；退而求其次：
-                # 找 "<|im_start|>assistant\n" 段落，把整段视为 assistant span
-                tag = "<|im_start|>assistant\n"
-                tag_pos = full_text.find(tag, search_from)
-                if tag_pos < 0:
-                    continue
-                start = tag_pos + len(tag)
-                end = full_text.find(IM_END, start)
-                end = end + len(IM_END) if end >= 0 else len(full_text)
-                assistant_spans.append((start, end))
-                search_from = end
-                continue
-
-            end = pos + len(content)
-            im_end_pos = full_text.find(IM_END, end)
-            if im_end_pos >= 0 and im_end_pos - end <= 8:
-                end = im_end_pos + len(IM_END)
-            assistant_spans.append((pos, end))
-            search_from = end
-
-        # eval / test：去掉最后一个 assistant，让模型续写
-        last_reference = ""
-        prompt_text = ""
-        if conversations and conversations[-1].get("role") == "assistant":
-            last_reference = (conversations[-1].get("content") or "").strip()
-            msgs_wo_last = self._prepend_system(conversations[:-1])
+        prompt_text = full_text.split("<|im_start|>assistant\n")[0] + "<|im_start|>assistant\n"   
+        content = msgs[-1].get("content","")
+        if self.mode == "test":
+            last_reference =  content if content not in ("", "None", None) else None  
         else:
-            msgs_wo_last = msgs
-        prompt_text = self.tokenizer.apply_chat_template(
-            msgs_wo_last, tokenize=False, add_generation_prompt=True,
-        )
+            last_reference = content
 
-        return full_text, assistant_spans, prompt_text, last_reference
+        return full_text, prompt_text, last_reference
 
     # -------------------------------------------------------------------------
     # __getitem__
@@ -151,72 +110,39 @@ class MultiModalInstructDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
 
         conversations = item["conversations"]
-        full_text, assistant_spans, prompt_text, last_reference = \
-            self._build_prompt(conversations)
+        full_text, prompt_text, last_reference = self._build_prompt(conversations)
 
         image_inputs = self.processor(images=image, return_tensors="pt")
         pixel_values = image_inputs["pixel_values"].squeeze(0)
 
-        if self.mode == "train":
-            enc = self.tokenizer(
-                full_text,
-                truncation=True,
-                max_length=self.max_length,
-                padding=False,
-                return_offsets_mapping=True,
-                return_tensors="pt",
-            )
-            input_ids = enc["input_ids"].squeeze(0)
-            attention_mask = enc["attention_mask"].squeeze(0)
-            offsets = enc["offset_mapping"].squeeze(0).tolist()
-
-            labels = torch.full_like(input_ids, fill_value=-100)
-            for tok_idx, (c_start, c_end) in enumerate(offsets):
-                if c_end <= c_start:
-                    continue
-                for s_start, s_end in assistant_spans:
-                    if c_start >= s_start and c_end <= s_end:
-                        labels[tok_idx] = input_ids[tok_idx]
-                        break
-
-            # 极端兜底：整段被截断导致没有任何 assistant token 留下
-            if (labels != -100).sum().item() == 0:
-                tail = max(1, input_ids.size(0) // 4)
-                labels[-tail:] = input_ids[-tail:]
-
-            reference = ""
-            if conversations and conversations[-1].get("role") == "assistant":
-                reference = (conversations[-1].get("content") or "").strip()
-
-            return {
-                "pixel_values": pixel_values,
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "prompt_len": 0,
-                "reference": reference,
-                "image_path": image_path,
-                "source": item.get("source", ""),
-            }
-
-        # eval / test
-        enc = self.tokenizer(
+        full_enc = self.tokenizer(
+            full_text,
+            truncation=True,
+            max_length=self.max_length,
+            padding=False,
+            return_offsets_mapping=True,
+            return_tensors="pt",
+        )
+        prompt_enc = self.tokenizer(
             prompt_text,
             truncation=True,
             max_length=self.max_length,
             padding=False,
-            return_tensors="pt",
+            return_tensors="pt"
         )
-        input_ids = enc["input_ids"].squeeze(0)
-        attention_mask = enc["attention_mask"].squeeze(0)
-        labels = torch.full_like(input_ids, fill_value=-100)
-
+        if self.mode == "train":
+            input_ids = full_enc["input_ids"].squeeze(0)
+            attention_mask = full_enc["attention_mask"].squeeze(0)
+        else:
+            input_ids = prompt_enc["input_ids"].squeeze(0)
+            attention_mask = prompt_enc["attention_mask"].squeeze(0)
+        prompt_len = prompt_enc["input_ids"].size(1)
+        
         return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": labels,
-            "prompt_len": input_ids.size(0),
+            "prompt_len": prompt_len,
             "reference": last_reference,
             "image_path": image_path,
             "source": item.get("source", ""),
@@ -232,21 +158,29 @@ class MultiModalCollator:
     labels 已在 Dataset 内预先生成（非 assistant 段 = -100），这里补 -100 到 max_len。
     """
 
-    def __init__(self, tokenizer, max_length: int = None):
+    def __init__(self, tokenizer, max_length: int = None, padding_side: str = "right"):
+        """
+        padding_side:
+            - "right"：训练/计算 loss 时使用，labels 用右 padding 对齐。
+            - "left" ：batch 生成时必须使用，否则 causal LM 的新 token 会被追加到 pad 之后，
+                       导致短 prompt 的样本产出乱码（常见现象：prompt tail 泄漏，比如输出里冒出 "assistant"）。
+        """
+        assert padding_side in ("right", "left")
+        
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.padding_side = padding_side
+
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         pixel_values = torch.stack([x["pixel_values"] for x in batch], dim=0)
         references = [x["reference"] for x in batch]
-        sources = [x.get("source", "") for x in batch]
-        image_paths = [x.get("image_path", "") for x in batch]
 
         input_ids_list = [x["input_ids"] for x in batch]
         attn_list = [x["attention_mask"] for x in batch]
-        labels_list = [x["labels"] for x in batch]
+        prompt_lens = [x["prompt_len"] for x in batch]
 
         max_seq_len = max(x.size(0) for x in input_ids_list)
         if self.max_length is not None:
@@ -254,30 +188,42 @@ class MultiModalCollator:
 
         pad_id = self.tokenizer.pad_token_id
 
-        padded_ids, padded_attn, padded_labels = [], [], []
-        for ids, attn, lbls in zip(input_ids_list, attn_list, labels_list):
+        padded_input_ids = []
+        padded_attention_mask = []
+        padded_labels = []
+        for ids, attn, prompt_len in zip(input_ids_list, attn_list, prompt_lens):
             ids = ids[:max_seq_len]
             attn = attn[:max_seq_len]
-            lbls = lbls[:max_seq_len]
+            prompt_len = min(prompt_len, max_seq_len)
 
             pad_len = max_seq_len - ids.size(0)
-            if pad_len > 0:
-                ids = torch.cat([ids, torch.full((pad_len,), pad_id, dtype=ids.dtype)])
-                attn = torch.cat([attn, torch.zeros(pad_len, dtype=attn.dtype)])
-                lbls = torch.cat([lbls, torch.full((pad_len,), -100, dtype=lbls.dtype)])
 
-            padded_ids.append(ids)
-            padded_attn.append(attn)
-            padded_labels.append(lbls)
+            pad_ids = torch.full((pad_len,), pad_id, dtype=ids.dtype)
+            pad_mask = torch.zeros(pad_len, dtype=attn.dtype)
+            pad_labels = torch.full((pad_len,), -100, dtype=ids.dtype)
+
+            labels_core = ids.clone()
+            labels_core[:prompt_len] = -100
+            
+            if self.padding_side == "right":
+                padded_ids = torch.cat([ids, pad_ids])
+                padded_mask = torch.cat([attn, pad_mask])
+                labels = torch.cat([labels_core, pad_labels]) if pad_len > 0 else labels_core
+            else:  # left padding —— 生成专用
+                padded_ids = torch.cat([pad_ids, ids])
+                padded_mask = torch.cat([pad_mask, attn])
+                labels = torch.cat([pad_labels, labels_core]) if pad_len > 0 else labels_core
+            
+            padded_input_ids.append(padded_ids)
+            padded_attention_mask.append(padded_mask)
+            padded_labels.append(labels)
 
         return {
             "pixel_values": pixel_values,
-            "input_ids": torch.stack(padded_ids, dim=0),
-            "attention_mask": torch.stack(padded_attn, dim=0),
+            "input_ids": torch.stack(padded_input_ids, dim=0),
+            "attention_mask": torch.stack(padded_attention_mask, dim=0),
             "labels": torch.stack(padded_labels, dim=0),
             "references": references,
-            "sources": sources,
-            "image_paths": image_paths,
         }
 
 
